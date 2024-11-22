@@ -144,11 +144,13 @@ class MVTSAMlora(nn.Module):
 
         if self.ifSAM:
             sam, img_embedding_size = sam_model_registry["vit_b"](image_size=self.img_size if not self.resize_rgb else 320, num_classes=1, checkpoint=None)
+            # 选择是否对sam进行lora
             if self.lora_finetune:
                 lora_sam = LoRA_Sam(sam, 4)
                 self.sam_image_encoder = lora_sam.sam.image_encoder
                 get_model_para(self.sam_image_encoder)
             else:
+                # 不对sam进行lora 冻结冻结参数
                 for param in sam.image_encoder.parameters():
                     param.requires_grad = False
                 self.sam_image_encoder = sam.image_encoder

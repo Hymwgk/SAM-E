@@ -1,6 +1,6 @@
 exp_id: sam_e
-tasks: all
-bs: 10
+tasks: open_drawer #all
+bs: 3
 ah: 5
 num_workers: 3
 epochs: 15

@@ -1,0 +1,9 @@
+samE/data/
+samE/replay/
+samE/runs/
+*.pyc
+*.egg-info
+*pth
+*so
+*.c
+*.o

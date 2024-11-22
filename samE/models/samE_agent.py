@@ -552,7 +552,20 @@ class samEAgent:
         eval_log: bool = False,
         reset_log: bool = False,
     ) -> dict:
+        """
+        进行一次模型更新，包括前向传播、损失计算和反向传播。
+
+        :param step: 当前训练步数
+        :param replay_sample: 一个包含输入数据和标签的字典
+        :param backprop: 是否执行反向传播更新模型参数
+        :param eval_log: 是否记录评估日志
+        :param reset_log: 是否重置日志记录
+        :return: 一个字典，包含损失和/或评估日志
         
+        模型仅依赖当前观测图像进行动作推理，但是每个时刻要推理以后多个时刻的动作
+        
+        """
+        # 预测的最长时间步
         ah = self.action_horizon
         # sample
         tasks = replay_sample["tasks"]
@@ -568,30 +581,34 @@ class samEAgent:
         obs_ignore_collisions = replay_sample["obs_ignore_collisions"].int()  # (b, 1) of int
         obs_ignore_collisions = obs_ignore_collisions.reshape(-1) # (b)
         
+        # 提取的语言目标嵌入，形状为 (batch_size, -1)
         lang_goal_embs = replay_sample["lang_goal_embs"][:, -1].float()
 
         # import pdb;pdb.set_trace()
-
-        proprio = arm_utils.stack_on_channel(replay_sample["low_dim_state"])  # (b, 4)    #  4 dimensions - proprioception: {gripper_open, left_finger, right_finger, timestep}
+        
+        #  4 dimensions - proprioception: {gripper_open, left_finger, right_finger, timestep}
+        proprio = arm_utils.stack_on_channel(replay_sample["low_dim_state"])  # (b, 4)    
         return_out = {}
 
         data_horizon = replay_sample["horizon"]
         
+        # 关闭梯度计算，用于数据预处理和增强
         with torch.no_grad():
             wpt_local_chunk=[]
             action_rot_list=[]
              
             obs, pcd = peract_utils._preprocess_inputs(replay_sample, self.cameras)   # [rgb, pcd], [pcd]
             pc, img_feat = rvt_utils.get_pc_img_feat(obs,pcd)  #  pc = point_cloud (bs,128*128*camera_nums,3)   img_feat=rgb  (bs,128*128*camera_nums,3)
-            
+            # 深拷贝点云数据，避免修改原始数据
             pcd = pc.detach().clone()
-            
+            # 遍历每个时间步
             for i in range(ah):  
                 if self._transform_augmentation and backprop:   # True
                     action_gripper_pose_s = action_gripper_pose[:,i]  # 
-                    
+                    # 数据增强
                     aug = True
                     if aug:
+                        # 第一个时间步，计算增强变换
                         if i == 0:
                             action_trans_con, action_rot, pc, trans_shift_4x4, rot_shift_4x4 = apply_se3_aug_con_sequence(  # TODO  augmentation: wpt,rot from action_gripper_pose_s,    pc augmentation also
                                 pcd=pcd,                                             # action_trans_con:(bs,3)  action_rot:(bs,4)  pc:(bs,128*128*4,3)
@@ -601,7 +618,7 @@ class samEAgent:
                                 rot_aug_range=torch.tensor(self._transform_augmentation_rpy),
                                 pc_aug=True
                             )
-                             
+                        # 后续时间步，直接应用之前计算的增强变换  
                         else:
                             # import pdb;pdb.set_trace()
                             action_trans_con, action_rot= apply_se3_aug_given_matrix(
@@ -611,22 +628,23 @@ class samEAgent:
                                 trans_shift_4x4 = trans_shift_4x4,
                                 rot_shift_4x4 = rot_shift_4x4,
                             ) 
-                            
+                        # 将增强后的数据转为 Tensor，并移动到显卡上
                         action_trans_con = torch.tensor(action_trans_con).to(pcd.device)
                         action_rot = torch.tensor(action_rot).to(pcd.device)
                         
-                    else:
+                    else: # 如果不进行增强，直接提取原始位姿
                         action_trans_con = action_gripper_pose_s[:, :3]
                         action_rot = action_gripper_pose_s[:, 3:7]
                     
                         action_trans_con = torch.tensor(action_trans_con).to(pcd.device)
                         action_rot = torch.tensor(action_rot).to(pcd.device)
 
-                    if i == 0:
+                    if i == 0: # 第一个时间步时，移除超出场景边界的点
                         pc, img_feat = rvt_utils.move_pc_in_bound(  # remove point out of bound from pc and corresponding point from img_feat
                                                     pc, img_feat, self.scene_bounds, no_op=not self.move_pc_in_bound) 
                 
                 # TODO: vectorize
+                # 对增强后的旋转数据进行归一化和调整方向
                 action_rot = action_rot.cpu().numpy()   
                 for j, _action_rot in enumerate(action_rot):
                     _action_rot = aug_utils.normalize_quaternion(_action_rot)
@@ -673,27 +691,31 @@ class samEAgent:
                 img_aug = 0
 
             dyn_cam_info = None
-        
+            
+        # 网络前向传播，获取预测值
         out = self._network(        #  pc = point_cloud (bs,128*128*camera_nums,3)   img_feat=rgb  (bs,128*128*camera_nums,3)   camera_nums = 4
-            pc=pc,
-            img_feat=img_feat,   
-            proprio=proprio,
-            lang_emb=lang_goal_embs,
-            img_aug=img_aug,
+            pc=pc, # 点云
+            img_feat=img_feat, # 图像特征
+            proprio=proprio,  # 本体状态
+            lang_emb=lang_goal_embs,  # 语言编码
+            img_aug=img_aug, # 图像增强
         )
-
+        # 从网络输出中提取预测值
         q_trans, rot_q, grip_q, collision_q, y_q, pts = self.get_q(
             out, dims=(bs, nc, ah, h, w)    # q_trans:torch.Size([3,220*220, ah, nc]) rot_q:(bs, ah,72*3) grip_q:(3, ah,2) collision_q:(3, ah,2)
                                              
         )
-        
+        # 处理动作标签，并计算损失
         action_rot_x_one_hot = []
         action_rot_y_one_hot = []
         action_rot_z_one_hot = []
         action_grip_one_hot = []
         action_collision_one_hot = []
         action_trans_chunk = []
+        
+        # 将样本的数值按照时间序列抽取出来，并进行排列
         for i in range(ah):
+            # 每个动作step
             action_rot_i = action_rot_list[i]
             action_grip_i = action_grip[:,i]
             
@@ -731,18 +753,23 @@ class samEAgent:
         loss_log = {}
         if backprop:
             # cross-entropy loss
+            # 平移损失：计算预测的路径点平移热图与标签之间的交叉熵损失
             trans_loss_list = self._cross_entropy_loss(q_trans, action_trans_chunk) # 
-            if ah_mask:
+            if ah_mask: # 如果使用了时间步掩码处理
                 # import pdb;pdb.set_trace()
+                # 使用 `horizon_loss_cal` 方法对损失进行时间步加权计算，返回总损失和逐时间步损失
                 trans_loss, trans_loss_ah = horizon_loss_cal(trans_loss_list, data_horizon)
             else:
+                # 如果没有启用掩码，直接计算平均损失
                 trans_loss = trans_loss_list.mean()
                 trans_loss_ah = torch.mean(trans_loss_list,(0,2))
-            
+            # 初始化旋转、夹爪和碰撞损失
             rot_loss_x = rot_loss_y = rot_loss_z = 0.0
             grip_loss = 0.0
             collision_loss = 0.0
+            # 如果启用了旋转、夹爪和碰撞损失的计算
             if self.add_rgc_loss:
+                # 1. x 轴旋转损失
                 rot_loss_x_list = self._cross_entropy_loss(
                     rot_q[:,:,0 * self._num_rotation_classes : 1 * self._num_rotation_classes,].transpose(1, 2),
                     action_rot_x_one_hot.argmax(-1),)
@@ -785,6 +812,7 @@ class samEAgent:
                     collision_loss = collision_loss_list.mean()
                     collision_loss_ah = torch.mean(collision_loss_list,0)
 
+            # 计算总损失，综合平移、旋转、夹爪和碰撞的损失
             total_loss = (
                 trans_loss
                 + rot_loss_x
@@ -798,7 +826,8 @@ class samEAgent:
             total_loss.backward()
             self._optimizer.step()
             self._lr_sched.step()
-
+            
+            # 计算逐时间步的总损失
             total_loss_ah = (
                 trans_loss_ah
                 + rot_loss_x_ah
@@ -824,6 +853,7 @@ class samEAgent:
                 ah_log[f'trans_loss_ah_{i}'] = trans_loss_ah.tolist()[i]
             
             # print(ah_log)
+            # 将逐时间步的损失日志合并到总体日志中
             loss_log.update(ah_log)
             manage_loss_log(self, loss_log, reset_log=reset_log)
             return_out['ah_log']=ah_log
@@ -861,11 +891,22 @@ class samEAgent:
 
         return return_out
 
-    @torch.no_grad()
+    @torch.no_grad() # 确保在推理过程中不计算梯度，节省内存并加速运行
     def act(
         self, step: int, observation: dict, deterministic=True, pred_distri=False
     ) -> ActResult:
+        """
+        根据当前的观测生成机器人的动作。
+
+        :param step: 当前动作生成的时间步
+        :param observation: 包含机器人传感数据（例如点云、图像）的字典
+        :param deterministic: 如果为 True，则选择最可能的动作；否则允许一定的随机性（此代码未使用此参数）
+        :param pred_distri: 决定是否需要预测分布（此代码未使用此参数）
+        :return: 包含机器人在每个时间步的动作的 `ActResult` 对象列表
+        """
+        # 如果模型配置启用了语言目标处理
         if self.add_lang:
+            # 从观测中提取语言目标，并用 CLIP 进行编码
             lang_goal_tokens = observation.get("lang_goal_tokens", None).long()
             _, lang_goal_embs = _clip_encode_text(self.clip_model, lang_goal_tokens[0])
             lang_goal_embs = lang_goal_embs.float()
@@ -879,34 +920,37 @@ class samEAgent:
         proprio = arm_utils.stack_on_channel(observation["low_dim_state"])
 
         obs, pcd = peract_utils._preprocess_inputs(observation, self.cameras)
+        # 获取点云？
         pc, img_feat = rvt_utils.get_pc_img_feat(
             obs,
             pcd,
         )
-
+        # 移除场景边界外的点，确保输入有效
         pc, img_feat = rvt_utils.move_pc_in_bound(
             pc, img_feat, self.scene_bounds, no_op=not self.move_pc_in_bound
         )
 
         # TODO: Vectorize
-        pc_new = []
-        rev_trans = []
+        pc_new = [] # 用于存储调整后的点云
+        rev_trans = [] # 用于存储用于反转调整的变换矩阵
         for _pc in pc:
             a, b = mvt_utils.place_pc_in_cube(
                 _pc,
-                with_mean_or_bounds=self._place_with_mean,
+                with_mean_or_bounds=self._place_with_mean, # 决定调整基于边界还是均值
                 scene_bounds=None if self._place_with_mean else self.scene_bounds,
             )
             pc_new.append(a)
             rev_trans.append(b)
         pc = pc_new
-
-        bs = len(pc)
+        # 提取网络输入维度和动作时间范围
+        bs = len(pc) 
         nc = self._net_mod.num_img
         h = w = self._net_mod.img_size
-        dyn_cam_info = None
-        ah = self.action_horizon
-
+        
+        dyn_cam_info = None # 动态相机信息的占位符
+        ah = self.action_horizon # 需要预测的动作步数
+        
+        # 通过网络进行前向传播以获取预测
         out = self._network(
             pc=pc,
             img_feat=img_feat,
@@ -914,17 +958,22 @@ class samEAgent:
             lang_emb=lang_goal_embs,
             img_aug=0,  # no img augmentation while acting
         )
+        # 推理，从网络输出中提取预测值
         q_trans, rot_q, grip_q, collision_q, y_q, _ = self.get_q(
             out, dims=(bs, nc, ah, h, w), only_pred=True   # TODO  action_horizon
         )
         action_chunking=[]
+        
         for i in range(ah):
-            q_trans_i = q_trans[:,:,i]
-            rot_q_i = rot_q[:,i]
-            grip_q_i = grip_q[:,i]
-            collision_q_i = collision_q[:,i]
+            # 提取当前时间步的预测
+            q_trans_i = q_trans[:,:,i]  # 预测的平移热图 Logits
+            rot_q_i = rot_q[:,i] # 预测的旋转  Logits 
+            grip_q_i = grip_q[:,i] # 预测的夹爪状态 Logits 
+            collision_q_i = collision_q[:,i] # 预测的碰撞状态 Logits 
+            # 将预测值转换为连续动作 
             pred_wpt, pred_rot_quat, pred_grip, pred_coll = self.get_pred(
             q_trans_i, rot_q_i, grip_q_i, collision_q_i, y_q, rev_trans, dyn_cam_info)
+            
             continuous_action = np.concatenate(
                 (
                     pred_wpt[0].cpu().numpy(),
@@ -934,6 +983,7 @@ class samEAgent:
                 )
             )
             action_chunking.append(ActResult(continuous_action))
+            
         return action_chunking
 
     def get_pred(
@@ -945,35 +995,44 @@ class samEAgent:
         y_q,
         rev_trans,
         dyn_cam_info,
-    ):
+    ):  
+        # 根据网络预测的平移热图生成局部坐标下的路径点
         pred_wpt_local = self._net_mod.get_wpt(q_trans, dyn_cam_info, y_q)
-
+        # 初始化一个列表，用于存储全局坐标系下的路径点
         pred_wpt = []
         for _pred_wpt_local, _rev_trans in zip(pred_wpt_local, rev_trans):
+            # 应用逆变换，将局部坐标的路径点转换回全局坐标
             pred_wpt.append(_rev_trans(_pred_wpt_local))
+        # 将路径点从列表转为 Tensor，并按批次合并
         pred_wpt = torch.cat([x.unsqueeze(0) for x in pred_wpt])
-
+        
+        # 处理旋转预测
+        # 1. 从 logits 中找到每个轴的最大值索引，表示预测的离散旋转类别
+        # 2. 对三个旋转轴（x、y、z）分别进行 argmax 操作
         pred_rot = torch.cat(
             (
                 rot_q[
                     :,
                     0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
-                ].argmax(1, keepdim=True),
+                ].argmax(1, keepdim=True), # x 轴的旋转预测
                 rot_q[
                     :,
                     1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
-                ].argmax(1, keepdim=True),
+                ].argmax(1, keepdim=True), # y 轴的旋转预测
                 rot_q[
                     :,
                     2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
-                ].argmax(1, keepdim=True),
+                ].argmax(1, keepdim=True), # z 轴的旋转预测
             ),
-            dim=-1,
+            dim=-1, # 沿最后一个维度拼接
         )
+        # 将离散的欧拉角预测值转换为连续的四元数
         pred_rot_quat = aug_utils.discrete_euler_to_quaternion(
             pred_rot.cpu(), self._rotation_resolution
         )
+        # 对夹爪状态进行预测，通过 argmax 获取最可能的状态（0 或 1）
         pred_grip = grip_q.argmax(1, keepdim=True)
+        # 对碰撞状态进行预测，通过 argmax 获取最可能的状态（0 或 1）
         pred_coll = collision_q.argmax(1, keepdim=True)
 
         return pred_wpt, pred_rot_quat, pred_grip, pred_coll
@@ -1000,8 +1059,9 @@ class samEAgent:
             sigma=self.gt_hm_sigma,
             thres_sigma_times=3,
         )
+        
         action_trans = action_trans.view(bs, nc, h * w).transpose(1, 2).clone()
-
+        
         return action_trans
 
     def reset(self):
